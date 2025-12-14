@@ -1,0 +1,3 @@
+[workspace]
+members = ["esp-csi-collector"]
+resolver = "2"
