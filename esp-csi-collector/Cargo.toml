@@ -28,3 +28,5 @@ esp-hal-embassy = { version = "0.9.0", default-features = false, optional = fals
 ] }
 esp-wifi = { version = "0.15.1", features = ["esp32s3", "wifi"] }
 esp-sync = { version = "0.1.1", features = ["esp32s3"] }
+embassy-net = { version = "0.6.0", features = ["tcp", "udp", "dhcpv4", "medium-ethernet"] }
+heapless = "0.8.0"
