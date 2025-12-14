@@ -1,40 +1,106 @@
+//! Example of Configuring Sniffer Mode for CSI Collection
+//!
+//! This configuration will capture CSI data from all the devices in range.
+//! Only one device is needed in this configuration. No SSID or Password need to be defined.
+
 #![no_std]
 #![no_main]
-#![deny(
-    clippy::mem_forget,
-    reason = "mem::forget is generally not safe to do with esp_hal types, especially those \
-    holding buffers for the duration of a data transfer."
-)]
-#![deny(clippy::large_stack_frames)]
 
-use esp_hal::clock::CpuClock;
-use esp_hal::main;
-use esp_hal::time::{Duration, Instant};
+use embassy_executor::Spawner;
+use embassy_time::{with_timeout, Duration, Timer};
+use esp_bootloader_esp_idf::esp_app_desc;
+use esp_csi_rs::{collector::CSISniffer, config::CSIConfig};
+use esp_hal::rng::Rng;
+use esp_hal::timer::timg::TimerGroup;
+use esp_println as _;
+use esp_println::println;
+use esp_wifi::{init, EspWifiController};
 
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    loop {}
+esp_app_desc!();
+
+extern crate alloc;
+
+macro_rules! mk_static {
+    ($t:ty,$val:expr) => {{
+        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
+        #[deny(unused_attributes)]
+        let x = STATIC_CELL.uninit().write(($val));
+        x
+    }};
 }
 
-// This creates a default app-descriptor required by the esp-idf bootloader.
-// For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
-esp_bootloader_esp_idf::esp_app_desc!();
+#[esp_hal_embassy::main]
+async fn main(spawner: Spawner) {
+    // Configure System Clock
+    let config = esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max());
+    // Take Peripherals
+    let peripherals = esp_hal::init(config);
 
-#[allow(
-    clippy::large_stack_frames,
-    reason = "it's not unusual to allocate larger buffers etc. in main"
-)]
-#[main]
-fn main() -> ! {
-    // generator version: 1.1.0
+    // Allocate some heap space
+    esp_alloc::heap_allocator!(size: 72 * 1024);
 
-    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-    let _peripherals = esp_hal::init(config);
+    // Initialize Embassy
+    let timg1 = TimerGroup::new(peripherals.TIMG1);
+    esp_hal_embassy::init(timg1.timer0);
+
+    // Instantiate peripherals necessary to set up  WiFi
+    let timer1 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
+    let wifi = peripherals.WIFI;
+    let timer = timer1.timer0;
+    let rng = Rng::new(peripherals.RNG);
+
+    // Initialize WiFi Controller
+    let init = &*mk_static!(EspWifiController<'static>, init(timer, rng).unwrap());
+
+    // Instantiate WiFi controller and interfaces
+    let (controller, interfaces) = esp_wifi::wifi::new(&init, wifi).unwrap();
+
+    println!("WiFi Controller Initialized");
+
+    // Create a Sniffer CSI Collector
+    // Don't filter any MAC addresses out
+    let mut csi_coll_snif = CSISniffer::new(CSIConfig::default(), controller).await;
+
+    // Initialize CSI Collector
+    csi_coll_snif.init(interfaces, &spawner).await.unwrap();
+
+    // Start Collection
+    csi_coll_snif.start_collection().await;
+
+    // Collect for 2 Seconds
+    with_timeout(Duration::from_secs(2), async {
+        loop {
+            csi_coll_snif.print_csi_w_metadata().await;
+        }
+    })
+    .await
+    .unwrap_err();
+
+    // Stop Collection
+    csi_coll_snif.stop_collection().await;
+
+    println!("Starting Again in 5 seconds");
+    Timer::after(Duration::from_secs(5)).await;
+    println!("Restarting Collection");
+
+    // Start Collection
+    csi_coll_snif.start_collection().await;
+
+    // Collect for 2 Seconds
+    with_timeout(Duration::from_secs(2), async {
+        loop {
+            csi_coll_snif.print_csi_w_metadata().await;
+        }
+    })
+    .await
+    .unwrap_err();
+
+    // Stop Collection
+    csi_coll_snif.stop_collection().await;
+
+    println!("Collection Ended");
 
     loop {
-        let delay_start = Instant::now();
-        while delay_start.elapsed() < Duration::from_millis(500) {}
+        Timer::after(Duration::from_secs(1)).await
     }
-
-    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v~1.0/examples
 }
