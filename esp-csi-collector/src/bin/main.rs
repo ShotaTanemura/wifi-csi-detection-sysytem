@@ -1,106 +1,90 @@
-//! Example of Configuring Sniffer Mode for CSI Collection
-//!
-//! This configuration will capture CSI data from all the devices in range.
-//! Only one device is needed in this configuration. No SSID or Password need to be defined.
-
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use embassy_executor::Spawner;
-use embassy_time::{with_timeout, Duration, Timer};
+use embassy_time::{Duration, Timer};
+
 use esp_bootloader_esp_idf::esp_app_desc;
-use esp_csi_rs::{collector::CSISniffer, config::CSIConfig};
-use esp_hal::rng::Rng;
-use esp_hal::timer::timg::TimerGroup;
-use esp_println as _;
+use esp_hal::{
+    clock::CpuClock,
+    rng::Rng,
+    timer::timg::TimerGroup,
+};
 use esp_println::println;
-use esp_wifi::{init, EspWifiController};
+
+use esp_wifi::{
+    init as wifi_init,
+    wifi::{WifiController, Interfaces},
+    EspWifiController,
+};
+
+use esp_csi_rs::{
+    collector::CSISniffer,
+    config::CSIConfig,
+};
 
 esp_app_desc!();
 
-extern crate alloc;
-
 macro_rules! mk_static {
-    ($t:ty,$val:expr) => {{
-        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
-        #[deny(unused_attributes)]
-        let x = STATIC_CELL.uninit().write(($val));
-        x
+    ($t:ty, $val:expr) => {{
+        static STATIC: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
+        STATIC.uninit().write($val)
     }};
 }
 
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) {
-    // Configure System Clock
-    let config = esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max());
-    // Take Peripherals
+    // ----- System Setup -----
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    // Allocate some heap space
-    esp_alloc::heap_allocator!(size: 72 * 1024);
+    esp_alloc::heap_allocator!(size: 128 * 1024);
 
-    // Initialize Embassy
-    let timg1 = TimerGroup::new(peripherals.TIMG1);
-    esp_hal_embassy::init(timg1.timer0);
+    // Embassy 初期化
+    let tg1 = TimerGroup::new(peripherals.TIMG1);
+    esp_hal_embassy::init(tg1.timer0);
 
-    // Instantiate peripherals necessary to set up  WiFi
-    let timer1 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
-    let wifi = peripherals.WIFI;
-    let timer = timer1.timer0;
+    println!("=== ESP32S3 CSI Sniffer (USB serial -> Raspberry Pi) ===");
+
+    // ----- WiFi init -----
+    let tg0 = TimerGroup::new(peripherals.TIMG0);
+    let timer0 = tg0.timer0;
     let rng = Rng::new(peripherals.RNG);
 
-    // Initialize WiFi Controller
-    let init = &*mk_static!(EspWifiController<'static>, init(timer, rng).unwrap());
+    // esp-wifi の初期化
+    let init = wifi_init(timer0, rng).unwrap();
+    // StaticCell に載せて 'static にする
+    let init_ref: &'static mut EspWifiController<'static> =
+        mk_static!(EspWifiController<'static>, init);
 
-    // Instantiate WiFi controller and interfaces
-    let (controller, interfaces) = esp_wifi::wifi::new(&init, wifi).unwrap();
+    let wifi = peripherals.WIFI;
 
-    println!("WiFi Controller Initialized");
+    // WiFi controller + interfaces を取得
+    let (wifi_ctrl, interfaces): (WifiController<'static>, Interfaces<'static>) =
+        esp_wifi::wifi::new(init_ref, wifi).unwrap();
 
-    // Create a Sniffer CSI Collector
-    // Don't filter any MAC addresses out
-    let mut csi_coll_snif = CSISniffer::new(CSIConfig::default(), controller).await;
+    // ----- CSISniffer の構築 -----
+    let mut sniffer = CSISniffer::new(CSIConfig::default(), wifi_ctrl).await;
 
-    // Initialize CSI Collector
-    csi_coll_snif.init(interfaces, &spawner).await.unwrap();
+    // CSI sniffer の初期化（タスクなどを内部で張る）
+    sniffer
+        .init(interfaces, &spawner)
+        .await
+        .expect("CSISniffer init failed");
 
-    // Start Collection
-    csi_coll_snif.start_collection().await;
+    // CSI collection start
+    sniffer.start_collection().await;
+    println!("CSI Sniffer started. Printing CSI to USB serial...");
 
-    // Collect for 2 Seconds
-    with_timeout(Duration::from_secs(2), async {
-        loop {
-            csi_coll_snif.print_csi_w_metadata().await;
-        }
-    })
-    .await
-    .unwrap_err();
-
-    // Stop Collection
-    csi_coll_snif.stop_collection().await;
-
-    println!("Starting Again in 5 seconds");
-    Timer::after(Duration::from_secs(5)).await;
-    println!("Restarting Collection");
-
-    // Start Collection
-    csi_coll_snif.start_collection().await;
-
-    // Collect for 2 Seconds
-    with_timeout(Duration::from_secs(2), async {
-        loop {
-            csi_coll_snif.print_csi_w_metadata().await;
-        }
-    })
-    .await
-    .unwrap_err();
-
-    // Stop Collection
-    csi_coll_snif.stop_collection().await;
-
-    println!("Collection Ended");
-
+    // ---- メインループ ----
     loop {
-        Timer::after(Duration::from_secs(1)).await
+        // ライブラリの組み込みヘルパで CSI + メタデータを丸ごと print
+        // （mac, rssi, channel, csi raw data 配列など）
+        sniffer.print_csi_w_metadata().await;
+
+        // ほんの少しだけ息継ぎ（なくてもいいが、他タスク配慮で 1ms）
+        Timer::after(Duration::from_millis(1)).await;
     }
 }
